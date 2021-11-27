@@ -3,12 +3,12 @@ A command line Task Scheduler to display a message or run a program at a certain
 
 Requires Python 2.7
 
-usage: 
-ts.py [-h] {display,add,update,delete,run,vacuum}
-
+usage:
+  ts.py [-h] {display,add,update,delete,run,vacuum}
+  
 optional arguments:
   -h, --help            show this help message and exit
-
+  
 subcommands:
     display             Display scheduled tasks.
     add                 Add a new scheduled task.
