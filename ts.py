@@ -1,7 +1,7 @@
 #-------------------------------------------------------------------------------
 # Name:        ts
 # Purpose:     Task Scheduler - to be run at startup
-#              requires Python 2.7
+#
 # Author:      Amir
 #
 # Created:     30/01/2011
