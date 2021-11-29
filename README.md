@@ -1,7 +1,7 @@
 # task-scheduler
 A command line Task Scheduler to display a message or run a program at a certain date and time. to be run at startup.
 
-Requires Python 2.7
+Requires Python 2.x
 
 usage:
   ts.py [-h] {display,add,update,delete,run,vacuum}
