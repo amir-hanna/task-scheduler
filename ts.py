@@ -10,15 +10,16 @@
 #-------------------------------------------------------------------------------
 #!/usr/bin/env python
 
-import sys
-import os
-import datetime
-import threading
-import shutil
-import argparse
 import sqlite3
+import argparse
+import multiprocessing
+import subprocess
+import datetime
+import time
+import shlex
+import os
+import sys
 
-database_file_name = 'ts.db3'
 
 def main():
     parser = argparse.ArgumentParser(description='Task scheduler.')
@@ -33,12 +34,20 @@ def main():
     parser_Display.set_defaults(func=Display)
 
     parser_Add = subparsers.add_parser('add', help='Add a new scheduled task.')
+    parser_Add.add_argument('name', type=str, help='Task name.')
     parser_Add.add_argument('program', type=str, help='Path of program to run.')
     parser_Add.add_argument('message', type=str, help='Message to display when task runs.')
     parser_Add.add_argument('frequency', type=int, help='Frequency in days to run the task, 0 for every logon.')
-    parser_Add.add_argument('offset', type=int,
-      help='Set last run date offset to 0 for today or a +/- number of days from today.')
-    #parser_Add.add_argument('--baz', choices='XYZ', help='baz help')
+    parser_Add.add_argument('--start_offset', type=int,
+      help='Set start date offset to 0 for today or a +/- number of days from today.')
+    parser_Add.add_argument('--end_offset', type=int,
+      help='Set end date offset to 0 for today or a +/- number of days from today.')
+    parser_Add.add_argument('--output', type=int, choices=[0,1], default=0,
+      help='Enter 0 if program does not communicate with standard output and \
+      error streams, otherwise enter 1 to detect and capture exceptions and \
+      error codes (useful for scripts).')
+    parser_Add.add_argument('--run_once', type=int, choices=[0,1],
+      help='Enter 1 to run this task one time only.')
     parser_Add.set_defaults(func=Add)
 
     parser_Update = subparsers.add_parser('update', help='Update task properties.')
@@ -46,8 +55,16 @@ def main():
     parser_Update.add_argument('--program', type=str, help='Path of program to run.')
     parser_Update.add_argument('--message', type=str, help='Message to display when task runs.')
     parser_Update.add_argument('--frequency', type=int, help='Frequency in days to run the task, 0 for every logon.')
-    parser_Update.add_argument('--offset', type=int,
-      help='Set last run date offset to 0 for today or a +/- number of days from today.')
+    parser_Update.add_argument('--start_offset', type=int,
+      help='Set start date offset to 0 for today or a +/- number of days from today.')
+    parser_Update.add_argument('--end_offset', type=int,
+      help='Set end date offset to 0 for today or a +/- number of days from today.')
+    parser_Update.add_argument('--output', choices=[0,1], type=int, help='Enter 0 \
+        if program does not communicate with standard output and error streams, \
+        otherwise enter 1 to detect and capture exceptions and error codes \
+        (useful for scripts).')
+    parser_Update.add_argument('--run_once', type=int, choices=[0,1],
+      help='Enter 1 to run this task one time only.')
     parser_Update.set_defaults(func=Update)
 
     parser_Delete = subparsers.add_parser('delete', help='Delete a scheduled task.')
@@ -55,7 +72,9 @@ def main():
     parser_Delete.set_defaults(func=Delete)
 
     parser_Run = subparsers.add_parser('run', help='Run all scheduled tasks according to saved properties.')
-    parser_Run.add_argument('seconds', type=int, help='Delay in seconds before run.')
+    parser_Run.add_argument('delay', type=int, help='Delay in seconds before running any program.')
+    parser_Run.add_argument('daemon', type=int, choices=[0,1], help='Enter 1 to run in daemon mode or 0 to run \
+                                one time only and exit - in the later case do not use daemon features in tasks.')
     parser_Run.set_defaults(func=Run)
 
     parser_vacuum = subparsers.add_parser('vacuum', help='Shrink database file.')
@@ -64,9 +83,12 @@ def main():
     args = parser.parse_args()
     args.func(args)
 
+
+# To do: Add new attributes
 class Args():
     def __init__(self, taskid=None, fromtaskid=None, totaskid=None,
-                 program=None, message=None, frequency=None, offset=None):
+                 program=None, message=None, frequency=None,
+                 offset=None, output=None):
         self.taskid = taskid
         self.fromtaskid = fromtaskid
         self.totaskid = totaskid
@@ -74,26 +96,58 @@ class Args():
         self.message = message
         self.frequency = frequency
         self.offset = offset
-	
-def MsgBox(txtError=None, txtMsg=None, title=None):
+        self.output = output
+
+def async_msgbox(txtError='', txtMsg='', title='', parent=None, height=6):
+    multiprocessing.Process(target=MsgBox, kwargs={'txtError':txtError, 'txtMsg':txtMsg, \
+                                        'title':title, 'parent':parent, 'height':height}).start()
+
+def MsgBox(txtError='', txtMsg='', title='', parent=None, height=6):
     import Tkinter
-    window = Tkinter.Tk()
+    if not parent:
+        root = Tkinter.Tk()
+        root.withdraw()
+
+    window = Tkinter.Toplevel()
+    window.transient(parent)
     window.wm_attributes("-topmost", 1)
     window.title(title)
-    if txtError:
-        labelerror = Tkinter.Label(window, padx=10, pady=10, wraplength=500,
-                            justify='left', text=txtError, fg='red')
-	labelerror.pack()
-    if txtMsg:
-        label = Tkinter.Label(window, padx=10, pady=10, wraplength=500,
-                            justify='left', text=txtMsg)
-        label.pack()
-    window.mainloop()
 
-def GetScriptLocation():
-    arg0 = sys.argv[0]
-    scriptName = shutil._basename(arg0)
-    return shutil.abspath(arg0).rstrip(scriptName)
+    scrollbar = Tkinter.Scrollbar(window)
+    scrollbar.pack(side=Tkinter.RIGHT, fill=Tkinter.Y)
+
+    textbox = Tkinter.Text(window, wrap=Tkinter.WORD, padx=5, pady=3, width=50, height=height, \
+                    font=("verdana", 10), background='beige', yscrollcommand=scrollbar.set)
+
+
+    textbox.tag_config('errors', foreground='red')
+    textbox.tag_config('messages', foreground='black')
+
+    textbox.insert(Tkinter.CURRENT, txtError, 'errors')
+
+    if txtError and txtMsg:
+        textbox.insert(Tkinter.CURRENT, '\n\n', 'errors')
+
+    textbox.insert(Tkinter.CURRENT, txtMsg, 'messages')
+    textbox.pack(fill=Tkinter.BOTH, expand=1)
+
+    scrollbar.config(command=textbox.yview)
+    textbox.config(state=Tkinter.DISABLED)
+    window.grab_set()
+    window.focus_set()
+
+    window.wait_window()
+    if parent:
+        parent.grab_set()
+        parent.focus_set()
+
+
+def GetAbsScriptPath():
+    AbsScriptPath = os.path.abspath( __file__ )
+    AbsScriptPath_no_extension = AbsScriptPath.rpartition('.')[0]
+    if not AbsScriptPath_no_extension:
+        AbsScriptPath_no_extension = AbsScriptPath
+    return (AbsScriptPath, AbsScriptPath_no_extension)
 
 def ShrinkDb(args):
     conn = GetConnection()
@@ -103,150 +157,288 @@ def ShrinkDb(args):
     print 'Done'
     print
 
-
-def Display(args):
+def get_data(sql_script, params=None):
     conn = GetConnection()
-    cur = conn.execute("""SELECT * from tblTask WHERE ID >= ? AND ID <= ? ORDER BY ID""",
-                            (args.fromtaskid, args.totaskid))
-    tasks = cur.fetchall()
+    if params:
+        cur = conn.execute(sql_script, params)
+    else:
+        cur = conn.execute(sql_script)
+    data = cur.fetchall()
     cur.close()
     conn.close()
+    return data
 
-    print '--------------------------'
-    for (ID, program, frequency, message, lastrun) in tasks:
-        print 'ID        : %s' % ID
-        print 'Program   : %s' % program
-        print 'Frequency : %s' % frequency
-        print 'Message   : %s' % message
-        print 'Last run  : %s' % datetime.date.fromordinal(lastrun).strftime("%A - %d %b %Y")
-        print
-
-
-def Add(args):
+def save_data(sql_script, params=None):
     conn = GetConnection()
-    intLastrun = datetime.date.today().toordinal() + args.offset
-    cur = conn.execute("""INSERT INTO tblTask
-                        (program, frequency, message, lastrun) values (?,?,?,?)""",
-                        (args.program, args.frequency, args.message, intLastrun)
-                      )
+    if params:
+        cur = conn.execute(sql_script, params)
+    else:
+        cur = conn.execute(sql_script)
     conn.commit()
     lastrowid = cur.lastrowid
     cur.close()
     conn.close()
+    return lastrowid # available when inserting otherwise None
+
+# To do: Add new attributes
+def Display(args = None):
+    sql_script = """SELECT ID, program, frequency, message, DATETIME(lastrun, 'unixepoch', 'localtime'), output
+                    FROM   tblTask
+                    WHERE ID >= ? AND ID <= ?
+                    ORDER BY ID"""
+
+    tasks = get_data(sql_script, (args.fromtaskid, args.totaskid))
+
+    print '--------------------------'
+    for (ID, program, frequency, message, lastrun, output) in tasks:
+        print 'ID        : %s' % ID
+        print 'Program   : %s' % program
+        print 'Frequency : %s' % frequency
+        print 'Message   : %s' % message
+        print 'Last run  : %s' % lastrun
+        print 'Output    : %s' % output
+        print
+
+# To do: Add new attributes
+def Add(args):
+    conn = GetConnection()
+
+    i_today = datetime.date.today().toordinal()
+    i_start = None
+    i_end = None
+
+    if args.start_offset:
+        i_start = i_today + args.start_offset
+
+    if args.end_offset:
+        i_end = i_today + args.end_offset
+
+    sql_script = """INSERT INTO tblTask
+                    (name, program, frequency, message, [start], [end], output) values (?,?,?,?,?,?,?)"""
+
+    lastrowid = save_data(sql_script, (args.name, args.program, args.frequency, \
+                                        args.message, i_start, i_end, args.output))
 
     args = Args(fromtaskid=lastrowid, totaskid=lastrowid)
     Display(args)
 
-
+# To do: Add new attributes
 def Update(args):
-    conn = GetConnection()
+    field_list = []
+    value_list = []
 
     if not args.program == None:
-        conn.execute("""UPDATE tblTask SET program = ? WHERE ID = ?""",
-                        (args.program, args.taskid))
-        conn.commit()
+        field_list.append('program = ?')
+        value_list.append(args.program)
 
     if not args.message == None:
-        conn.execute("""UPDATE tblTask SET message = ? WHERE ID = ?""",
-                        (args.message, args.taskid))
-        conn.commit()
+        field_list.append('message = ?')
+        value_list.append(args.message)
 
     if not args.frequency == None:
-        conn.execute("""UPDATE tblTask SET frequency = ? WHERE ID = ?""",
-                        (args.frequency, args.taskid))
-        conn.commit()
+        field_list.append('frequency = ?')
+        value_list.append(args.frequency)
 
-    if not args.offset == None:
-        intNewdate = datetime.date.today().toordinal() + args.offset
-        conn.execute("""UPDATE tblTask SET lastrun = ? WHERE ID = ?""",
-                        (intNewdate, args.taskid))
-        conn.commit()
+    if not args.output == None:
+        field_list.append('output = ?')
+        value_list.append(args.output)
 
-    conn.close()
+    if len(field_list) == 0:
+        return
+
+    str_sql = 'UPDATE tblTask SET {0} WHERE ID = ?'
+    str_sql = str_sql.format(', '.join(field_list))
+    value_list.append(args.taskid)
+
+    save_data(str_sql, tuple(value_list))
+
     args = Args(fromtaskid=args.taskid, totaskid=args.taskid)
     Display(args)
 
+
 def Delete(args):
-    conn = GetConnection()
-    conn.execute("""DELETE FROM tblTask WHERE ID = ?""", (args.taskid,))
-    conn.commit()
-    conn.close()
+    save_data('DELETE FROM tblTask WHERE ID = ?', (args.taskid,))
     print '--------------------------'
     print 'Task DELETED : %s' % args.taskid
     print
 
+
 def GetConnection():
-    strDatabasePath = os.path.join(GetScriptLocation() + database_file_name)
+    strDatabasePath = GetAbsScriptPath()[1] + '.db3'
     Existed = False
+
     if os.path.exists(strDatabasePath):
         Existed = True
 
-    conn = sqlite3.connect(strDatabasePath)
+    conn = sqlite3.connect(strDatabasePath, timeout=30)
 
     if not Existed:
-        conn.execute("""CREATE TABLE tblTask
-                     (ID INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-                      program TEXT,
-                      frequency INTEGER,
-                      message TEXT,
-                      lastrun INTEGER)""")
+        conn.execute("""CREATE TABLE [tblTask] (
+                                        [ID]            INTEGER  PRIMARY KEY AUTOINCREMENT NOT NULL,
+                                        [name]          TEXT     NOT NULL,
+                                        [program]       TEXT     NULL,
+                                        [frequency]     INTEGER  NULL,
+                                        [message]       TEXT     NULL,
+                                        [output]        INTEGER  NULL,
+                                        [start]         INTEGER  NULL,
+                                        [end]           INTEGER  NULL,
+                                        [run_once]      INTEGER  NULL,
+                                        [startup_only]  INTEGER  NULL,
+                                        [lastrun]       INTEGER  NULL,
+                                        [running]       INTEGER  NULL,
+                                        [disabled]      INTEGER  NULL
+                                                )""")
 
     return conn
 
-def RunProcess(program):
-    import subprocess
-    import shlex
-    subprocess.Popen(shlex.split(str(program)))
+
+def run_program(ID, program, output=0):
+    txtError = RunProcess(ID, program, output)
+
+    if not txtError:
+        try:
+            save_data("UPDATE tblTask SET lastrun = strftime('%s', 'now') + 0 WHERE ID = ?", (ID,))
+        except Exception as ex:
+            txtError += 'Program ran but time stamp failed:' + '\n'
+            txtError += program + '\n'
+            txtError += str(ex).rstrip('\n') + '\n'
+            txtError += 'Task ID: %s' % ID
+
+    return txtError
 
 
-def Run(args):
-    rlock = threading.Condition()
-    rlock.acquire()
-    rlock.wait(args.seconds)
 
-    intCurrentDateOrdinal = datetime.date.today().toordinal()
-    conn = GetConnection()
-    cur = conn.execute("""SELECT ID, program, message, lastrun
-                            FROM tblTask WHERE (lastrun + frequency) <= ? """,
-                            (intCurrentDateOrdinal,))
-    tasks = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    txtMessage = ''
+# To do: test function
+def RunProcess(ID, program, output=0):
     txtError = ''
+    input_list = shlex.split(str(program))
+    if not output:
+        try:
+            subprocess.Popen(input_list)
+        except Exception as ex:
+            txtError += 'Error executing program:' + '\n' + str(program) + '\n'
+            txtError += str(ex).rstrip('\n') + '\n'
+            txtError += 'Task ID: %s' % ID
+    else:
+        try:
+            p = subprocess.Popen(input_list, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            (str_out, str_error) = p.communicate()
+            if str_error:
+                raise Exception(str_error)
+        except Exception as ex:
+            txtError += 'Error executing program:' + '\n' + str(program) + '\n'
+            txtError += str(ex).rstrip('\n') + '\n'
+            txtError += 'Task ID: %s' % ID
 
-    for (ID, program, message, lastrun) in tasks:
-        if message.strip():
-            txtMessage += message + '\n' + 'Last run: '
-            txtMessage += datetime.date.fromordinal(lastrun).strftime("%A - %d %b %Y") + '\n'
-            txtMessage += 'Task ID: %s' % ID + '\n\n'
+    return txtError
 
-        if program.strip():
-            try:
-                RunProcess(program)
-            except:
-                txtError += 'Error executing program:' + '\n' + str(program) + '\n'
-                txtError += 'Task ID: %s' % ID + '\n\n'
-            else:
-                args = Args(taskid=ID, offset=0)
-                Update(args)
+
+def lock_tasks(task_id_list, flag):
+    str_sql = "UPDATE tblTask SET running = {0} WHERE  ID IN ({1})"
+    str_sql = str_sql.format(flag, ','.join('?' * len(task_id_list)))
+    try:
+        save_data(str_sql, tuple(task_id_list))
+    except Exception as ex:
+        return str(ex)
+    else:
+        return ''
+
+# To do: test function - create ring in python - manual page 56
+# create checkphone in python
+# create front ends wxpython, jtk, qt
+# check mysql
+def Run(args):
+    time.sleep(args.delay)
+    startup = True
+
+    # set all tasks as not running yet
+    try:
+        save_data('UPDATE tblTask SET running = NULL')
+    except Exception as ex:
+        async_msgbox(txtError=str(ex), title='Task Scheduler', height=12)
+
+
+    if not args.daemon:
+        run2(args, startup)
+        return
+
+    while True:
+        multiprocessing.Process(target=run2, args=(args, startup)).start()
+        time.sleep(30)
+        startup = False
+
+
+def run2(args, startup):
+    sql_script = """FROM   tblTask
+                    WHERE  IFNULL(lastrun, 0) + IFNULL(frequency, 0) <= strftime('%s', 'now') + 0
+                    {0}
+                    AND    strftime('%s', 'now') + 0 BETWEEN IFNULL([start], 0) AND IFNULL([end], 32503672800)
+                    AND    NOT (IFNULL(lastrun, 0) > 0 AND IFNULL(run_once, 0) = 1)
+                    AND    NOT IFNULL(running, 0) = 1
+                    AND    NOT IFNULL(disabled, 0) = 1"""
+
+    if startup:
+        sql_script = sql_script.format('')
+    else:
+        sql_script = sql_script.format('AND NOT IFNULL(startup_only, 0) = 1')
+
+
+    sql_query = "SELECT ID, program, message, output, DATETIME(lastrun, 'unixepoch', 'localtime') " + sql_script
+    tasks = get_data(sql_query)
+
+    if len(tasks) == 0:
+        return
+
+    task_id_list = [ID for (ID, program, message, output, lastrun) in tasks ]
+
+    # set tasks as running
+    lock_error = lock_tasks(task_id_list, 1)
+    if lock_error:
+        async_msgbox(txtError=lock_error, title='Task Scheduler', height=12)
+
+    program_list = [ (ID, program, output)
+                        for (ID, program, message, output, lastrun) in tasks if program ]
+
+    error_list = []
+
+    for (ID, program, output) in program_list:
+        txtError = run_program(ID, program, output)
+        if txtError:
+            error_list.append(txtError)
+
+
+    txtError = ''
+    txtMessage = ''
+
+    msg_list = [ message + '\n' + 'Last run: %s' %lastrun + '\n' + 'Task ID: %s' %ID \
+                 for (ID, program, message, output, lastrun) in tasks if message ]
+    txtMessage = '\n\n'.join(msg_list)
+
+    txtError = '\n\n'.join(error_list)
 
 
     if txtMessage:
         try:
-            MsgBox(txtError=txtError.rstrip('\n\n'),
-                   txtMsg=txtMessage.rstrip('\n\n'), title='Task Scheduler')
-        except:
-            import tkMessageBox
-            tkMessageBox.showerror('Task Scheduler error', 'Unable to display messages.')
-        else:
-            for (ID, program, message, lastrun) in tasks:
-                if message.strip() and not program.strip():
-                    args = Args(taskid=ID, offset=0)
-                    Update(args)
+            async_msgbox(txtError=txtError, txtMsg=txtMessage, title='Task Scheduler', height=12)
+
+            id_list = [ID for (ID, program, message, output, lastrun) in tasks if message and not program]
+            str_sql = """UPDATE tblTask
+                         SET    lastrun = strftime('%s', 'now') + 0
+                         WHERE  ID IN ({0})"""
+
+            str_sql = str_sql.format(','.join('?' * len(id_list)))
+
+            save_data(str_sql, tuple(id_list))
+        except Exception as ex:
+            async_msgbox(txtError=str(ex), title='Task Scheduler', height=12)
+
     elif txtError:
-        MsgBox(txtError=txtError.rstrip('\n\n'), title='Task Scheduler')
+        async_msgbox(txtError=txtError, title='Task Scheduler', height=12)
+
+    # set tasks as not running
+    lock_error = lock_tasks(task_id_list, 0)
+    if lock_error:
+        async_msgbox(txtError=lock_error, title='Task Scheduler', height=12)
 
 
 
